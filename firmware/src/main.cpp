@@ -1587,6 +1587,32 @@ char serialLine[1600]; // biggest frame is #STATUS at ~600 bytes
 size_t serialLineLen = 0;
 
 bool wiredActive() { return wiredEverLinked && (millis() - lastSerialFrameMs) < 15000UL; }
+const char *displayModeName(DisplayMode m);
+
+void serialAck(int id, bool ok, const char *error = nullptr) {
+  if (id < 0) return; // keep the old one-way bridge protocol compatible
+  JsonDocument doc;
+  doc["id"] = id;
+  doc["ok"] = ok;
+  doc["brightness"] = brightness;
+  doc["display"] = displayModeName(displayMode);
+  if (error) doc["error"] = error;
+  Serial.print("#ACK ");
+  serializeJson(doc, Serial);
+  Serial.println();
+}
+
+void serialInfo(int id) {
+  JsonDocument doc;
+  doc["id"] = id;
+  doc["brightness"] = brightness;
+  doc["display"] = displayModeName(displayMode);
+  doc["effective"] = displayModeName(effectiveMode());
+  doc["wired"] = wiredActive();
+  Serial.print("#INFO ");
+  serializeJson(doc, Serial);
+  Serial.println();
+}
 
 // First data over either transport replaces the boot/portal screen.
 void showMainUiIfNeeded() {
@@ -1601,7 +1627,12 @@ void handleSerialFrame(char *line) {
   lastSerialFrameMs = millis();
   wiredEverLinked = true;
   if (!strncmp(line, "#HELLO", 6)) {
-    Serial.printf("#DEVICE {\"name\":\"aiclock\",\"fw\":\"%s\"}\n", FW_VERSION);
+    Serial.printf("#DEVICE {\"name\":\"aiclock\",\"fw\":\"%s\",\"protocol\":2}\n", FW_VERSION);
+    return;
+  }
+  if (!strncmp(line, "#INFO? ", 7)) {
+    JsonDocument doc;
+    if (!deserializeJson(doc, line + 7) && doc["id"].is<int>()) serialInfo(doc["id"].as<int>());
     return;
   }
   if (!strncmp(line, "#STATUS ", 8)) {
@@ -1628,10 +1659,13 @@ void handleSerialFrame(char *line) {
   if (!strncmp(line, "#CMD ", 5)) {
     JsonDocument doc;
     if (deserializeJson(doc, line + 5)) return;
+    int id = doc["id"].is<int>() ? doc["id"].as<int>() : -1;
+    bool changed = false;
     if (doc["brightness"].is<int>()) {
       brightness = constrain(doc["brightness"].as<int>(), 0, 100);
       applyBrightness();
       saveBrightness();
+      changed = true;
     }
     const char *mode = doc["display"] | (const char *)nullptr;
     if (mode) {
@@ -1642,8 +1676,11 @@ void handleSerialFrame(char *line) {
       else if (m == "net") displayMode = MODE_NET;
       else if (m == "music") displayMode = MODE_MUSIC;
       else if (m == "stock") displayMode = MODE_STOCK;
+      else { serialAck(id, false, "invalid display"); return; }
+      changed = true;
       // the effectiveMode transition handler in loop() repaints the chrome
     }
+    serialAck(id, changed, changed ? nullptr : "empty command");
     return;
   }
 }
