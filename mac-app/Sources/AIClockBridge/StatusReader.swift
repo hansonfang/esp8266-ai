@@ -28,6 +28,7 @@ struct CodexStatus {
     var weeklyWindowMin: Int? = nil
     var weeklyResetMin: Int? = nil
     var needsInput: Bool = false
+    var petState: String = "idle"
 }
 
 struct Snapshot {
@@ -63,6 +64,8 @@ final class StatusService {
 
     private var claudeEvent: AgentEvent?
     private var codexEvent: AgentEvent?
+    private struct PetVisualEvent { let state: String; let at: TimeInterval; let ttl: TimeInterval }
+    private var codexPetEvent: PetVisualEvent?
     // "needs input": a permission/approval prompt is on screen, waiting on the
     // user. Set by an attention event, cleared by the next concrete lifecycle
     // event (the prompt got answered) or by TTL.
@@ -98,6 +101,18 @@ final class StatusService {
         lock.lock()
         defer { lock.unlock() }
         let now = Date().timeIntervalSince1970
+        if agent == "codex" {
+            let visual: (String, TimeInterval)?
+            switch event {
+            case "reviewing": visual = ("review", 10 * 60)
+            case "failure": visual = ("failed", 10 * 60)
+            case "success", "Stop": visual = ("jumping", 4)
+            case "attention": visual = ("waiting", 5 * 60)
+            case "thinking", "tool-running", "UserPromptSubmit", "PreToolUse": visual = ("running", 10 * 60)
+            default: visual = nil
+            }
+            if let visual { codexPetEvent = PetVisualEvent(state: visual.0, at: now, ttl: visual.1) }
+        }
         // Claude Notification: flash only for permission prompts, not for
         // "task done / waiting for your input" notifications.
         if event == "Notification" {
@@ -193,6 +208,13 @@ final class StatusService {
         snap.codex.status = overrideStatus(snap.codex.status, with: codexEvent, now: now)
         snap.claude.needsInput = needsInput(claudeNeedsInputAt, now: now)
         snap.codex.needsInput = needsInput(codexNeedsInputAt, now: now)
+        if snap.codex.needsInput {
+            snap.codex.petState = "waiting"
+        } else if let event = codexPetEvent, now - event.at < event.ttl {
+            snap.codex.petState = event.state
+        } else {
+            snap.codex.petState = snap.codex.status == "working" ? "running" : "idle"
+        }
         snap.musicPlaying = musicPlayingProvider?() ?? false
         return snap
     }
@@ -380,6 +402,7 @@ extension Snapshot {
                 "weekly_window_min": num(codex.weeklyWindowMin),
                 "weekly_reset_min": num(codex.weeklyResetMin),
                 "needs_input": codex.needsInput,
+                "pet_state": codex.petState,
             ],
         ]
         return (try? JSONSerialization.data(withJSONObject: dict)) ?? Data("{}".utf8)

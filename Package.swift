@@ -10,6 +10,7 @@ let package = Package(
             path: ".",
             sources: [
                 "usb-cli/main.swift",
+                "mac-app/Sources/AIClockBridge/CodexPetPackage.swift",
                 "mac-app/Sources/AIClockBridge/StatusReader.swift",
                 "mac-app/Sources/AIClockBridge/UsageFetcher.swift",
             ]
