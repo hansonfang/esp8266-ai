@@ -111,4 +111,33 @@ final class StatusReaderTests: XCTestCase {
         XCTAssertEqual(status.activeTasks, 0)
         XCTAssertTrue(status.needsInput)
     }
+
+    func testUnknownHookSessionCannotCreatePhantomRunningTask() throws {
+        try writeRollout(id: "visible", sessionID: "visible",
+                         events: [lifecycle("task_complete", at: -5)])
+        let service = StatusService(claudeDir: root.appendingPathComponent("claude").path,
+                                    codexDir: root.path)
+
+        service.recordEvent(agent: "codex", event: "PreToolUse",
+                            sessionID: "hidden-approval-reviewer")
+        let status = service.snapshot().codex
+
+        XCTAssertEqual(status.status, "idle")
+        XCTAssertEqual(status.activeTasks, 0)
+        XCTAssertEqual(status.petState, "idle")
+    }
+
+    func testKnownHookSessionCanStartNextTurnBeforeLogRefresh() throws {
+        try writeRollout(id: "visible", sessionID: "visible",
+                         events: [lifecycle("task_complete", at: -5)])
+        let service = StatusService(claudeDir: root.appendingPathComponent("claude").path,
+                                    codexDir: root.path)
+
+        service.recordEvent(agent: "codex", event: "PreToolUse", sessionID: "visible")
+        let status = service.snapshot().codex
+
+        XCTAssertEqual(status.status, "working")
+        XCTAssertEqual(status.activeTasks, 1)
+        XCTAssertEqual(status.petState, "running")
+    }
 }

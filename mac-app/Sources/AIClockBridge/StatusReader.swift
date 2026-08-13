@@ -218,6 +218,7 @@ final class StatusService {
     private func mergeCodexEvents(into status: inout CodexStatus, now: TimeInterval) {
         codexEvents = codexEvents.filter { now - $0.value.at < workingEventTTL }
         codexPetEvents = codexPetEvents.filter { now - $0.value.at < $0.value.ttl }
+        let knownSessions = Set(status.executionSessionIDs.values)
         for (session, resolvedAt) in status.inputResolvedSessionAt {
             if let requestedAt = codexNeedsInputAt[session], resolvedAt >= requestedAt {
                 codexNeedsInputAt.removeValue(forKey: session)
@@ -237,8 +238,9 @@ final class StatusService {
                 if let completedAt = status.completedSessionAt[session], completedAt >= event.at {
                     continue
                 }
-                if session == "__legacy__" { legacyWorking = true }
-                else if !active.contains(where: { status.executionSessionIDs[$0] == session }) {
+                if session == "__legacy__", knownSessions.isEmpty { legacyWorking = true }
+                else if knownSessions.contains(session),
+                        !active.contains(where: { status.executionSessionIDs[$0] == session }) {
                     let hookExecution = "hook:\(session)"
                     active.insert(hookExecution)
                     status.executionSessionIDs[hookExecution] = session
@@ -287,7 +289,15 @@ final class StatusService {
                 (priority[$0.state] ?? 0, $0.at) < (priority[$1.state] ?? 0, $1.at)
             }?.state ?? "running"
         } else {
-            status.petState = codexPetEvents.values.max { $0.at < $1.at }?.state ?? "idle"
+            // Hooks from hidden approval/review sessions can reach the global
+            // hook config without ever producing a user-visible rollout.
+            // Such unknown sessions must not animate an otherwise idle pet.
+            let knownVisuals = codexPetEvents.compactMap { session, event -> PetVisualEvent? in
+                guard knownSessions.contains(session)
+                    || (session == "__legacy__" && knownSessions.isEmpty) else { return nil }
+                return event
+            }
+            status.petState = knownVisuals.max { $0.at < $1.at }?.state ?? "idle"
         }
     }
 

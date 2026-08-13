@@ -260,6 +260,7 @@ sealed class StatusService
             if (_codexNeedsInputAt.TryGetValue(session, out var requestedAt) && resolvedAt >= requestedAt)
                 _codexNeedsInputAt.Remove(session);
 
+        var knownSessions = status.ExecutionSessionIds.Values.ToHashSet();
         var active = new HashSet<string>(status.ActiveExecutionIds);
         var legacyWorking = false;
         var hasFreshIdle = false;
@@ -271,8 +272,9 @@ sealed class StatusService
             {
                 if (status.CompletedSessionAt.TryGetValue(session, out var completedAt)
                     && completedAt >= ev.At) continue;
-                if (session == "__legacy__") legacyWorking = true;
-                else if (!active.Any(id => status.ExecutionSessionIds.GetValueOrDefault(id) == session))
+                if (session == "__legacy__" && knownSessions.Count == 0) legacyWorking = true;
+                else if (knownSessions.Contains(session)
+                         && !active.Any(id => status.ExecutionSessionIds.GetValueOrDefault(id) == session))
                 {
                     var id = $"hook:{session}";
                     active.Add(id);
