@@ -23,7 +23,10 @@ final class USBClock {
     private var acknowledgements: [Int: [String: Any]] = [:]
     private var brightness: Int?
     private var display: String?
+    private var effectiveDisplay: String?
     private var screenOn: Bool?
+    private var wiredActive: Bool?
+    private var devicePetState: String?
     private var firmware = ""
     private var protocolVersion = 0
     private var customPet = false
@@ -39,6 +42,9 @@ final class USBClock {
         lock.lock(); defer { lock.unlock() }
         return ["connected": linked, "port": port, "brightness": brightness.map { $0 as Any } ?? NSNull(),
                 "display": display ?? NSNull(), "screen_on": screenOn.map { $0 as Any } ?? NSNull(),
+                "effective_display": effectiveDisplay ?? NSNull(),
+                "wired_active": wiredActive.map { $0 as Any } ?? NSNull(),
+                "device_pet_state": devicePetState ?? NSNull(),
                 "fw": firmware, "protocol": protocolVersion, "custom_pet": customPet,
                 "pet_upload": ["active": petUploadActive, "sent": petUploadSent, "total": petUploadTotal,
                                "done": petUploadDone, "error": petUploadError.map { $0 as Any } ?? NSNull()]]
@@ -61,6 +67,19 @@ final class USBClock {
     func setAgentEvent(_ type: String, ttlMs: Int) -> [String: Any]? {
         guard ["thinking", "tool-running", "reviewing", "success", "failure", "attention"].contains(type) else { return nil }
         return command(["event": type, "ttl_ms": min(max(ttlMs, 250), 600_000)])
+    }
+
+    /// Hooks are latency-sensitive: push the freshly aggregated status now
+    /// instead of waiting for the next periodic serial tick.
+    @discardableResult
+    func pushStatusNow() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard linked, !petUploadActive else { return false }
+        lastStatus = Date()
+        var frame = Data("#STATUS ".utf8)
+        frame.append(service.snapshot().jsonData())
+        frame.append(0x0A)
+        return writeLocked(frame)
     }
 
     func resetCodexPet() -> [String: Any]? {
@@ -178,14 +197,16 @@ final class USBClock {
             screenOn = mainScreenOn
             _ = commandLocked(["screen": mainScreenOn ? "on" : "off"])
         }
-        if now.timeIntervalSince(lastStatus) > 5 {
+        if now.timeIntervalSince(lastStatus) > 2 {
             lastStatus = now
             var frame = Data("#STATUS ".utf8)
             frame.append(service.snapshot().jsonData())
             frame.append(0x0A)
             _ = writeLocked(frame)
         }
-        if now.timeIntervalSince(lastInfo) > 30 {
+        // Keep device-side telemetry fresh enough to distinguish a real
+        // display-state lag from stale bridge cache after short pet events.
+        if now.timeIntervalSince(lastInfo) > 2 {
             lastInfo = now
             let id = nextID; nextID += 1
             _ = writeLocked(Data("#INFO? {\"id\":\(id)}\n".utf8))
@@ -273,9 +294,12 @@ final class USBClock {
                let info = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 brightness = (info["brightness"] as? NSNumber)?.intValue ?? brightness
                 display = info["display"] as? String ?? display
+                effectiveDisplay = info["effective"] as? String ?? effectiveDisplay
                 screenOn = info["screen_on"] as? Bool ?? screenOn
+                wiredActive = info["wired"] as? Bool ?? wiredActive
                 firmware = info["fw"] as? String ?? firmware
                 customPet = info["custom_pet"] as? Bool ?? customPet
+                devicePetState = info["pet_state"] as? String ?? devicePetState
             }
         }
         if input.count > 16_384 { input.removeAll() }
@@ -329,7 +353,10 @@ final class LocalServer {
                 return self.receiveRequest(connection, buffer: request)
             }
             let header = String(decoding: request[..<headerRange.lowerBound], as: UTF8.self)
-            let contentLength = header.split(separator: "\n").first { $0.lowercased().hasPrefix("content-length:") }
+            // CRLF is one extended grapheme in Swift, so splitting on the
+            // literal "\n" can leave the entire header as one element.
+            let contentLength = header.split(whereSeparator: { $0.isNewline })
+                .first { $0.lowercased().hasPrefix("content-length:") }
                 .flatMap { Int($0.split(separator: ":", maxSplits: 1).last?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "") } ?? 0
             let expected = headerRange.upperBound + contentLength
             guard request.count >= expected else {
@@ -382,10 +409,14 @@ final class LocalServer {
                 }
             } else if let name = event["event"] as? String {
                 let agent = event["agent"] as? String ?? "codex"
-                service.recordEvent(agent: agent, event: name, message: event["message"] as? String)
-                if agent == "codex", let mapped = Self.openPetEvent(for: name) {
-                    _ = clock.setAgentEvent(mapped.type, ttlMs: mapped.ttlMs)
-                }
+                let sessionID = event["session_id"] as? String ?? event["conversation_id"] as? String
+                service.recordEvent(agent: agent, event: name, message: event["message"] as? String,
+                                    sessionID: sessionID)
+                // Lifecycle state is carried by #STATUS. Do not also install
+                // a long-lived device event overlay: firmware prioritizes that
+                // overlay over pet_state and could stay "running" for 10 min
+                // after JSONL already reported task_complete/turn_aborted.
+                _ = clock.pushStatusNow()
                 payload = json(["ok": true])
             } else {
                 code = "400 Bad Request"; payload = json(["ok": false, "error": "type or event required"])
@@ -417,19 +448,11 @@ final class LocalServer {
         let s = service.snapshot().codex
         return json([
             "usb": clock.state,
-            "codex": ["status": s.status, "weekly_pct": s.weeklyPct.map { $0 as Any } ?? NSNull(), "weekly_reset_min": s.weeklyResetMin.map { $0 as Any } ?? NSNull(),
+            "codex": ["status": s.status, "pet_state": s.petState, "needs_input": s.needsInput,
+                      "active_tasks": s.activeTasks,
+                      "weekly_pct": s.weeklyPct.map { $0 as Any } ?? NSNull(), "weekly_reset_min": s.weeklyResetMin.map { $0 as Any } ?? NSNull(),
                       "primary_pct": s.primaryPct.map { $0 as Any } ?? NSNull(), "primary_reset_min": s.primaryResetMin.map { $0 as Any } ?? NSNull()]
         ])
-    }
-
-    private static func openPetEvent(for hook: String) -> (type: String, ttlMs: Int)? {
-        switch hook {
-        case "UserPromptSubmit": return ("thinking", 600_000)
-        case "PreToolUse", "SubagentStart", "WorktreeCreate": return ("tool-running", 600_000)
-        case "Stop", "SessionEnd": return ("success", 3_000)
-        case "Elicitation", "PermissionRequest": return ("attention", 60_000)
-        default: return nil
-        }
     }
 
     private func json(_ object: Any) -> Data { (try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8) }
@@ -444,6 +467,7 @@ final class LocalServer {
     <div class="row"><span>固件</span><strong id="fw">—</strong></div>
     <div class="row"><span>宠物</span><strong id="petKind">默认</strong></div>
     <div class="row"><span>Codex</span><strong id="status">—</strong></div>
+    <div class="row"><span>ESP 实际状态</span><strong id="deviceState">—</strong></div>
     <div class="row"><span>周额度</span><strong id="weekly">—</strong></div>
     <div class="row"><span>重置</span><strong id="reset">—</strong></div>
     <div class="row"><span>显示</span><select id="mode" onchange="setMode()"><option value="auto">自动</option><option value="codex">Codex</option><option value="claude">Claude</option><option value="net">网速</option><option value="music">音乐</option><option value="stock">股票</option></select></div>
@@ -463,7 +487,7 @@ final class LocalServer {
     const $=id=>document.getElementById(id), fmt=n=>n==null?'—':n+'%', fmtMin=n=>n==null?'—':n<60?n+' 分钟':Math.floor(n/60)+' 小时';
     const states=[[6,1100],[8,1060],[8,1060],[4,700],[5,840],[8,1220],[6,1010],[6,820],[6,1030]], frameW=192,frameH=208,target=120,headerBytes=128,totalBytes=820928;
     let lastUploadActive=false;
-    async function load(){try{let x=await fetch('/api/status').then(r=>r.json()),c=x.codex,u=x.usb,p=u.pet_upload;$('usb').textContent=u.connected?'已连接 '+u.port:'未连接';$('fw').textContent=u.fw?(u.fw+' · 协议 '+u.protocol):'—';$('petKind').textContent=u.custom_pet?'自定义九状态':'默认';$('status').textContent=c.status;$('weekly').textContent=fmt(c.weekly_pct);$('reset').textContent=fmtMin(c.weekly_reset_min);if(u.brightness!=null){$('brightness').value=u.brightness;$('level').textContent=u.brightness+'%'}if(u.display)$('mode').value=u.display;if(p){let pct=p.total?Math.round(p.sent*100/p.total):0;$('petProgress').value=pct;$('petReset').disabled=p.active;if(p.active){$('petUpload').disabled=true;$('petNotice').textContent='USB 上传中 '+pct+'%（'+p.sent+' / '+p.total+' 字节）'}else if(lastUploadActive){$('petUpload').disabled=false;$('petNotice').textContent=p.error?'上传失败：'+p.error:'✅ 九状态宠物已安装';}lastUploadActive=p.active}}catch{$('usb').textContent='服务不可用'}}
+    async function load(){try{let x=await fetch('/api/status').then(r=>r.json()),c=x.codex,u=x.usb,p=u.pet_upload;$('usb').textContent=u.connected?'已连接 '+u.port:'未连接';$('fw').textContent=u.fw?(u.fw+' · 协议 '+u.protocol):'—';$('petKind').textContent=u.custom_pet?'自定义九状态':'默认';$('status').textContent=c.status+' · '+c.pet_state+' · '+c.active_tasks+' agent';$('deviceState').textContent=u.device_pet_state||'—';$('weekly').textContent=fmt(c.weekly_pct);$('reset').textContent=fmtMin(c.weekly_reset_min);if(u.brightness!=null){$('brightness').value=u.brightness;$('level').textContent=u.brightness+'%'}if(u.display)$('mode').value=u.display;if(p){let pct=p.total?Math.round(p.sent*100/p.total):0;$('petProgress').value=pct;$('petReset').disabled=p.active;if(p.active){$('petUpload').disabled=true;$('petNotice').textContent='USB 上传中 '+pct+'%（'+p.sent+' / '+p.total+' 字节）'}else if(lastUploadActive){$('petUpload').disabled=false;$('petNotice').textContent=p.error?'上传失败：'+p.error:'✅ 九状态宠物已安装';}lastUploadActive=p.active}}catch{$('usb').textContent='服务不可用'}}
     async function call(path,body){let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}),x=await r.json();$('notice').textContent=r.ok?'设备已确认':x.error;return r.ok}
     async function save(){await call('/api/brightness',{level:+$('brightness').value})}
     async function setMode(){await call('/api/display',{mode:$('mode').value})}
@@ -520,7 +544,12 @@ case "serve":
     catch { fputs("Could not start server: \(error.localizedDescription)\n", stderr); exit(1) }
 case "status":
     let s = service.snapshot().codex
-    let data = try! JSONSerialization.data(withJSONObject: ["status": s.status, "weekly_pct": s.weeklyPct.map { $0 as Any } ?? NSNull(), "weekly_reset_min": s.weeklyResetMin.map { $0 as Any } ?? NSNull()])
+    let data = try! JSONSerialization.data(withJSONObject: [
+        "status": s.status, "pet_state": s.petState, "needs_input": s.needsInput,
+        "active_tasks": s.activeTasks,
+        "weekly_pct": s.weeklyPct.map { $0 as Any } ?? NSNull(),
+        "weekly_reset_min": s.weeklyResetMin.map { $0 as Any } ?? NSNull(),
+    ])
     print(String(decoding: data, as: UTF8.self))
 case "brightness":
     guard let raw = CommandLine.arguments.dropFirst(2).first, let level = Int(raw), (0...100).contains(level) else { printUsage(); exit(2) }

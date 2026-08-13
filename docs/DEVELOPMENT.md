@@ -280,10 +280,16 @@ Mac 端常驻进程由 LaunchAgent（`~/Library/LaunchAgents/local.AIClockBridge
   不会拖慢 Claude Code；与已有 hooks 共存，靠命令里的 `8765/event` 标记幂等）
 - 映射：UserPromptSubmit/Pre/PostToolUse 等 → working（TTL 10 分钟，覆盖长工具调用）；
   Stop/Notification 等 → idle（TTL 60 秒，只用来立刻压掉 mtime 的"工作尾巴"）
-- Codex 侧已写入 `~/.codex/hooks.json` + `config.toml [features] hooks = true`，
-  但 Codex 要求在 TUI 里跑一次 `/hooks` 信任新命令后才生效；未信任前走 mtime 兜底。
-- 局限：事件是全局的不分会话——A 会话 Stop 会把还在干活的 B 会话压成 idle 最多 60 秒
-  （B 的下一个工具调用事件会立刻翻回 working）。
+- Codex 侧使用当前桌面版读取的 `~/.codex/hooks.json`（仓库模板为
+  `tools/codex-aiclock-hooks.json`）；`hooks` 功能在当前版本中默认启用。
+  新命令需要在桌面端「Settings → Hooks」中信任后生效；未信任前走 JSONL 兜底。
+- Hook 会携带 session id，bridge 按会话聚合状态：A 会话 Stop 不会再覆盖仍在运行的 B 会话。
+  未触发 Hook 时，bridge 从 Codex JSONL 的 `task_started` / `task_complete` 配对判断活跃任务；
+  只有旧格式日志才回退到文件 mtime。
+- Codex 的 `PermissionRequest` 会出现在 `PreToolUse` 之后、实际命令执行之前，而且没有对应的
+  “批准完成”事件，因此不能直接映射为 waiting；真正的提问由 `request_user_input` 的
+  `InputRequest` + JSONL `function_call_output` 配对维护。多 Agent 按 rollout execution id 计数，
+  同一任务里的子 Agent 完成不会覆盖仍在运行的父任务或兄弟 Agent。
 
 ### 7.1 OpenPet Agent Event（USB 时钟）
 
