@@ -45,8 +45,10 @@ const size_t CLAUDE_FRAME_BYTES = (size_t)CLAUDE_SPRITE_W * CLAUDE_SPRITE_H * 2;
 const size_t CODEX_FRAME_BYTES = (size_t)CODEX_SPRITE_W * CODEX_SPRITE_H * 2;
 const size_t CLAUDE_FRAME_BYTES_332 = (size_t)CLAUDE_SPRITE_W * CLAUDE_SPRITE_H;
 const size_t CODEX_FRAME_BYTES_332 = (size_t)CODEX_SPRITE_W * CODEX_SPRITE_H;
+const int CODEX_PET_W = 144, CODEX_PET_H = 144;
+const size_t CODEX_PET_FRAME_BYTES_332 = (size_t)CODEX_PET_W * CODEX_PET_H;
 const size_t AIPET_HEADER_BYTES = 128;
-const size_t CODEX_PET_DEVICE_BYTES = AIPET_HEADER_BYTES + (size_t)57 * CODEX_FRAME_BYTES_332;
+const size_t CODEX_PET_DEVICE_BYTES = AIPET_HEADER_BYTES + (size_t)57 * CODEX_PET_FRAME_BYTES_332;
 
 // We never hold a whole sprite frame in RAM. Decoding a GIF needs ~24KB of
 // heap for AnimatedGIF's own buffers, which wouldn't fit alongside a static
@@ -54,6 +56,7 @@ const size_t CODEX_PET_DEVICE_BYTES = AIPET_HEADER_BYTES + (size_t)57 * CODEX_FR
 // the display path and the decoder work one screen-row at a time through these
 // two small scratch rows (SCREEN_W is the widest we ever need).
 uint16_t rowBuf[SCREEN_W];     // current row being drawn / decoded
+uint16_t scaledRowBuf[SCREEN_W]; // one nearest-neighbor-expanded sprite row
 uint8_t sprite8Row[SCREEN_W];
 uint8_t prevSprite8Row[SCREEN_W];
 
@@ -75,6 +78,8 @@ unsigned long petStateOverrideDeadlineMs = 0;
 const int SCREEN_CX = 120, SCREEN_CY = 120;
 const int RING_MARGIN = 4;      // inset from screen edge
 const int RING_THICKNESS = 10;  // ring bar thickness
+const int SIDEBAR_CX = 44;
+const int PET_CX = 151, PET_W = 150;
 const unsigned long ANIM_INTERVAL_MS = 120;  // sprite frame advance
 const unsigned long FLASH_INTERVAL_MS = 400; // "urgent" flash speed
 const unsigned long SWITCH_BOTH_MS = 2000;   // both apps working: alternate fast
@@ -374,7 +379,7 @@ bool loadCodexPetFile(const char *path) {
   if (!f || f.size() < AIPET_HEADER_BYTES) { if (f) f.close(); return false; }
   uint8_t header[AIPET_HEADER_BYTES];
   if (f.read(header, sizeof(header)) != sizeof(header) || memcmp(header, "AIPET1", 6) ||
-      readLE16(header + 6) != CODEX_SPRITE_W || readLE16(header + 8) != CODEX_SPRITE_H ||
+      readLE16(header + 6) != CODEX_PET_W || readLE16(header + 8) != CODEX_PET_H ||
       header[10] != PET_STATE_COUNT || readLE32(header + 12) != (uint32_t)f.size()) {
     f.close(); return false;
   }
@@ -384,7 +389,7 @@ bool loadCodexPetFile(const char *path) {
     const uint8_t *entry = header + 20 + i * 12;
     PetStateMeta meta = { entry[0], readLE16(entry + 2), readLE32(entry + 4), readLE32(entry + 8) };
     if (meta.frames == 0 || meta.frames > 8 || meta.delayMs < 40 || meta.offset != expectedOffset ||
-        meta.length != (uint32_t)meta.frames * CODEX_FRAME_BYTES_332) { f.close(); return false; }
+        meta.length != (uint32_t)meta.frames * CODEX_PET_FRAME_BYTES_332) { f.close(); return false; }
     codexPetStates[i] = meta;
     expectedOffset += meta.length;
   }
@@ -447,29 +452,41 @@ int codexFrameCount() {
   return codexCustom ? codexCustomFrames : CODEX_SPRITE_FRAMES;
 }
 
-// Draws one sprite frame centered on screen, one row at a time so we never
-// need a full-frame buffer: each row comes either from the custom LittleFS
-// file (streamed) or the compiled-in PROGMEM default (copied row-by-row).
+// Draws one sprite frame in the right-hand pet pane. Each source row is
+// expanded with nearest-neighbor scaling, so the animation remains crisp
+// without needing a full-frame buffer.
+void drawScaledSpriteRow(int x0, int y, int dstW, int srcW) {
+  for (int x = 0; x < dstW; x++) scaledRowBuf[x] = rowBuf[x * srcW / dstW];
+  tft.pushImage(x0, y, dstW, 1, scaledRowBuf);
+}
+
 void drawSpriteFrame(bool custom, const char *file, const uint16_t *const *progmemFrames, int frameIdx, int w,
                      int h, size_t frameBytes) {
-  int x0 = SCREEN_CX - w / 2, y0 = SCREEN_CY - h / 2;
+  int dstW = PET_W, dstH = h * PET_W / w;
+  int x0 = PET_CX - dstW / 2, y0 = SCREEN_CY - dstH / 2;
   size_t rowBytes = (size_t)w * 2;
   if (custom) {
     File f = LittleFS.open(file, "r");
     if (!f) return;
     size_t frameBytes332 = (size_t)w * h;
-    f.seek(4 + (size_t)frameIdx * frameBytes332);
-    for (int r = 0; r < h; r++) {
-      f.read(sprite8Row, w);
+    int sourceRow = -1;
+    for (int r = 0; r < dstH; r++) {
+      int srcY = r * h / dstH;
+      if (srcY != sourceRow) {
+        sourceRow = srcY;
+        f.seek(4 + (size_t)frameIdx * frameBytes332 + (size_t)srcY * w);
+        f.read(sprite8Row, w);
+      }
       for (int x = 0; x < w; x++) rowBuf[x] = rgb332ToWire(sprite8Row[x]);
-      tft.pushImage(x0, y0 + r, w, 1, rowBuf);
+      drawScaledSpriteRow(x0, y0 + r, dstW, w);
     }
     f.close();
   } else {
     const uint16_t *frame = progmemFrames[frameIdx];
-    for (int r = 0; r < h; r++) {
-      memcpy_P(rowBuf, frame + (size_t)r * w, rowBytes);
-      tft.pushImage(x0, y0 + r, w, 1, rowBuf);
+    for (int r = 0; r < dstH; r++) {
+      int srcY = r * h / dstH;
+      memcpy_P(rowBuf, frame + (size_t)srcY * w, rowBytes);
+      drawScaledSpriteRow(x0, y0 + r, dstW, w);
     }
   }
 }
@@ -523,8 +540,8 @@ uint16_t agentEventColor() {
   switch (agentEvent) {
     case EVENT_THINKING: return TFT_CYAN;
     case EVENT_REVIEWING: return TFT_ORANGE;
-    case EVENT_FAILURE: return flashOn ? TFT_RED : TFT_BLACK;
-    case EVENT_ATTENTION: return flashOn ? TFT_YELLOW : TFT_BLACK;
+    case EVENT_FAILURE: return TFT_RED;
+    case EVENT_ATTENTION: return TFT_RED;
     default: return TFT_GREEN;
   }
 }
@@ -576,17 +593,52 @@ PetState desiredCodexPetState() {
 // True when the app currently on screen is waiting on a permission/approval
 // prompt — drives the red "look now, act" border flash.
 bool currentAppNeedsInput() {
-  return (currentApp == APP_CLAUDE ? claudeStatus.needsInput : codexStatus.needsInput) ||
-         (currentApp == APP_CODEX && agentEventActive() && agentEvent == EVENT_ATTENTION);
+  if (currentApp == APP_CLAUDE) return claudeStatus.needsInput;
+  return agentEventActive() && agentEvent == EVENT_ATTENTION;
 }
 
-// Working vs idle is now conveyed by the sprite animation itself (moving vs
-// still), not by ring color. The ring just stays steady green, except
-// bridge-stale which flashes red ("check it now") and overrides everything.
-uint16_t currentStatusColor() {
-  if (bridgeStale()) return flashOn ? TFT_RED : TFT_BLACK;
-  if (agentEventActive() && currentApp == APP_CODEX) return agentEventColor();
+// The quota ring doubles as a status light. Idle is the only steady state;
+// every other state flashes in its semantic color while retaining the quota
+// percentage as the illuminated length.
+uint16_t codexStateColor(PetState state) {
+  switch (state) {
+    case PET_FAILED: return TFT_RED;
+    case PET_WAITING: return TFT_GREEN;
+    case PET_REVIEW: return TFT_ORANGE;
+    case PET_WAVING: return TFT_YELLOW;
+    case PET_RUNNING:
+    case PET_RUNNING_LEFT:
+    case PET_RUNNING_RIGHT: return TFT_CYAN;
+    default: return TFT_GREEN; // idle and successful jumping
+  }
+}
+
+bool currentStatusFlashes() {
+  if (currentAppNeedsInput() || (everPolled && bridgeStale())) return true;
+  if (currentApp == APP_CODEX) {
+    if (agentEventActive()) return true;
+    PetState state = desiredCodexPetState();
+    return state != PET_IDLE && state != PET_WAITING;
+  }
+  return claudeStatus.status == "working" || claudeStatus.status == "waiting" ||
+         claudeStatus.status == "offline";
+}
+
+uint16_t currentStatusBaseColor() {
+  if (currentAppNeedsInput() || (everPolled && bridgeStale())) return TFT_RED;
+  if (currentApp == APP_CODEX) {
+    if (agentEventActive()) return agentEventColor();
+    return codexStateColor(desiredCodexPetState());
+  }
+  if (claudeStatus.status == "working") return TFT_CYAN;
+  if (claudeStatus.status == "waiting") return TFT_RED;
+  if (claudeStatus.status == "offline") return TFT_RED;
   return TFT_GREEN;
+}
+
+uint16_t currentStatusColor() {
+  if (currentStatusFlashes() && !flashOn) return TFT_BLACK;
+  return currentStatusBaseColor();
 }
 
 // The ring is skipped when nothing changed (see drawSquareRing) so the 5s
@@ -663,12 +715,19 @@ void drawCodexSprite(int frameIdx) {
     const PetStateMeta &meta = codexPetStates[codexPetState];
     File f = LittleFS.open(CODEX_PET_FILE, "r");
     if (!f) return;
-    f.seek(meta.offset + (size_t)frameIdx * CODEX_FRAME_BYTES_332);
-    int x0 = SCREEN_CX - CODEX_SPRITE_W / 2, y0 = SCREEN_CY - CODEX_SPRITE_H / 2;
-    for (int y = 0; y < CODEX_SPRITE_H; y++) {
-      if (f.read(sprite8Row, CODEX_SPRITE_W) != CODEX_SPRITE_W) break;
-      for (int x = 0; x < CODEX_SPRITE_W; x++) rowBuf[x] = rgb332ToWire(sprite8Row[x]);
-      tft.pushImage(x0, y0 + y, CODEX_SPRITE_W, 1, rowBuf);
+    const int dstW = PET_W, dstH = CODEX_PET_H * PET_W / CODEX_PET_W;
+    const int x0 = PET_CX - dstW / 2, y0 = SCREEN_CY - dstH / 2;
+    int sourceRow = -1;
+    for (int y = 0; y < dstH; y++) {
+      int srcY = y * CODEX_PET_H / dstH;
+      if (srcY != sourceRow) {
+        sourceRow = srcY;
+        f.seek(meta.offset + (size_t)frameIdx * CODEX_PET_FRAME_BYTES_332 +
+               (size_t)srcY * CODEX_PET_W);
+        if (f.read(sprite8Row, CODEX_PET_W) != CODEX_PET_W) break;
+      }
+      for (int x = 0; x < CODEX_PET_W; x++) rowBuf[x] = rgb332ToWire(sprite8Row[x]);
+      drawScaledSpriteRow(x0, y0 + y, dstW, CODEX_PET_W);
     }
     f.close();
     return;
@@ -681,11 +740,10 @@ String pctText(float pct) {
   return pct >= 0 ? String((int)pct) + "%" : "-";
 }
 
-// Quota readout below the sprite: two columns ("5h" / "Wk"), small grey label
-// over a big font-4 percentage. Values repaint only when their text changes
-// (force = after a full-screen clear), so the 5s poll never flashes them.
-const int QUOTA_LABEL_Y = 183, QUOTA_VALUE_Y = 199;
-const int QUOTA_COL1_X = 70, QUOTA_COL2_X = 170;
+// Quota readout in the left sidebar. Values repaint only when their text
+// changes (force = after a full-screen clear), so the 5s poll never flashes.
+const int QUOTA_5H_LABEL_Y = 66, QUOTA_5H_VALUE_Y = 78;
+const int QUOTA_WK_LABEL_Y = 174, QUOTA_WK_VALUE_Y = 188;
 String lastQuota5h, lastQuotaWk;
 
 // pushImage() colors must be pre-byte-swapped (this firmware never enables
@@ -881,33 +939,34 @@ void drawQuotaText(float hourPct, float weekPct, bool force) {
   if ((int8_t)single != lastSingle) {
     lastSingle = (int8_t)single;
     force = true;
-    tft.fillRect(0, QUOTA_LABEL_Y, 240, QUOTA_VALUE_Y + 22 - QUOTA_LABEL_Y, TFT_BLACK);
+    tft.fillRect(15, QUOTA_5H_LABEL_Y, 58, QUOTA_5H_VALUE_Y + 22 - QUOTA_5H_LABEL_Y, TFT_BLACK);
+    tft.fillRect(15, QUOTA_WK_LABEL_Y, 58, QUOTA_WK_VALUE_Y + 22 - QUOTA_WK_LABEL_Y, TFT_BLACK);
   }
   if (single) {
-    if (force) drawSqTextC("Wk", 120, QUOTA_LABEL_Y, 2, 2, TFT_LIGHTGREY);
+    if (force) drawSqTextC("Wk", SIDEBAR_CX, QUOTA_WK_LABEL_Y, 2, 2, TFT_LIGHTGREY);
     String v = pctText(weekPct);
     if (force || v != lastQuotaWk) {
       lastQuotaWk = v;
       lastQuota5h = "";
-      tft.fillRect(120 - 50, QUOTA_VALUE_Y, 100, 22, TFT_BLACK);
-      drawDotTextC(v, 120, QUOTA_VALUE_Y, 3, 1, TFT_WHITE);
+      tft.fillRect(15, QUOTA_WK_VALUE_Y, 58, 22, TFT_BLACK);
+      drawDotTextC(v, SIDEBAR_CX, QUOTA_WK_VALUE_Y, 3, 0, TFT_WHITE);
     }
     return;
   }
   if (force) {
-    drawSqTextC("5h", QUOTA_COL1_X, QUOTA_LABEL_Y, 2, 2, TFT_LIGHTGREY);
-    drawSqTextC("Wk", QUOTA_COL2_X, QUOTA_LABEL_Y, 2, 2, TFT_LIGHTGREY);
+    drawSqTextC("5h", SIDEBAR_CX, QUOTA_5H_LABEL_Y, 2, 2, TFT_LIGHTGREY);
+    drawSqTextC("Wk", SIDEBAR_CX, QUOTA_WK_LABEL_Y, 2, 2, TFT_LIGHTGREY);
   }
   String v1 = pctText(hourPct), v2 = pctText(weekPct);
   if (force || v1 != lastQuota5h) {
     lastQuota5h = v1;
-    tft.fillRect(QUOTA_COL1_X - 50, QUOTA_VALUE_Y, 100, 22, TFT_BLACK);
-    drawDotTextC(v1, QUOTA_COL1_X, QUOTA_VALUE_Y, 3, 1, TFT_WHITE);
+    tft.fillRect(15, QUOTA_5H_VALUE_Y, 58, 22, TFT_BLACK);
+    drawDotTextC(v1, SIDEBAR_CX, QUOTA_5H_VALUE_Y, 2, 1, TFT_WHITE);
   }
   if (force || v2 != lastQuotaWk) {
     lastQuotaWk = v2;
-    tft.fillRect(QUOTA_COL2_X - 50, QUOTA_VALUE_Y, 100, 22, TFT_BLACK);
-    drawDotTextC(v2, QUOTA_COL2_X, QUOTA_VALUE_Y, 3, 1, TFT_WHITE);
+    tft.fillRect(15, QUOTA_WK_VALUE_Y, 58, 22, TFT_BLACK);
+    drawDotTextC(v2, SIDEBAR_CX, QUOTA_WK_VALUE_Y, 3, 0, TFT_WHITE);
   }
 }
 
@@ -983,11 +1042,11 @@ void drawCountdown(bool force) {
   // A length change ("100:00" -> "99:59:59") shifts every glyph cell, so the
   // whole region must clear; otherwise same-length digits line up 1:1.
   if (t.length() != lastCountdown.length()) force = true;
-  const int P = 6, R = 2, VAL_Y = 100; // countdown dot metrics
-  int x = SCREEN_CX - dotTextWidth(t, P, R) / 2;
+  const int P = 4, R = 1, VAL_Y = 106; // countdown dot metrics
+  int x = PET_CX - dotTextWidth(t, P, R) / 2;
   if (force) {
-    tft.fillRect(SCREEN_CX - 99, 66, 198, 84, TFT_BLACK);
-    drawDotTextC(showingCd == CD_WEEK ? "Wk RESET IN" : "5h RESET IN", SCREEN_CX, 72, 2, 0,
+    tft.fillRect(80, 66, 146, 84, TFT_BLACK);
+    drawDotTextC(showingCd == CD_WEEK ? "Wk RESET IN" : "5h RESET IN", PET_CX, 78, 2, 0,
                  TFT_LIGHTGREY);
     drawDotText(t, x, VAL_Y, P, R, TFT_ORANGE);
   } else {
@@ -1009,7 +1068,7 @@ void drawCountdown(bool force) {
 // which app the screen is currently showing. Drawn row-by-row from PROGMEM
 // through rowBuf, same as the sprite path. (A dotted-logo experiment got
 // reverted: at 40px the sampled dots were unrecognizable.)
-const int LOGO_X = 14, LOGO_Y = 18;
+const int LOGO_X = 24, LOGO_Y = 17;
 
 void drawAppLogo() {
   const uint16_t *logo = (currentApp == APP_CLAUDE) ? claude_logo_0 : codex_logo_0;
@@ -1022,19 +1081,17 @@ void drawAppLogo() {
 }
 
 void drawAgentEventLabel() {
-  tft.fillRect(78, 15, 82, 20, TFT_BLACK);
+  tft.fillRect(90, 15, 132, 20, TFT_BLACK);
   if (!agentEventActive()) return;
   tft.setTextDatum(TC_DATUM);
   tft.setTextColor(agentEventColor(), TFT_BLACK);
-  tft.drawString(agentEventLabel(), SCREEN_CX, 19, 2);
+  tft.drawString(agentEventLabel(), PET_CX, 19, 2);
 }
 
-// Days until the weekly window resets, top-right corner inside the ring
-// (mirrors the app logo top-left). Weekly only - the 5h window is too short
-// for a day count to say anything. Under a day it degrades to hours.
-// The x extent (166..225) stays clear of both the ring (>=226) and the
-// sprite (x<=180 but only from y=60 down); the value must end above y=60.
-const int RESET_CX = 198, RESET_LABEL_Y = 18, RESET_VALUE_Y = 33;
+// Days until the weekly window resets in the left sidebar. Weekly only - the
+// 5h window is too short for a day count to say anything. Under a day it
+// degrades to hours.
+const int RESET_CX = SIDEBAR_CX, RESET_LABEL_Y = 120, RESET_VALUE_Y = 135;
 String lastResetDays;
 
 String resetDaysText(int min) {
@@ -1047,7 +1104,7 @@ void drawResetDays(bool force) {
   String t = resetDaysText(currentWeekResetMin());
   if (!force && t == lastResetDays) return;
   lastResetDays = t;
-  tft.fillRect(RESET_CX - 32, RESET_LABEL_Y, 60, RESET_VALUE_Y + 27 - RESET_LABEL_Y, TFT_BLACK);
+  tft.fillRect(15, RESET_LABEL_Y, 58, RESET_VALUE_Y + 27 - RESET_LABEL_Y, TFT_BLACK);
   if (t.length() == 0) return;
   drawTinyBoldText("RESET", RESET_CX, RESET_LABEL_Y, TFT_LIGHTGREY);
   // 2 chars ("3d") get big 3px dots; 3 chars ("18h") drop a size to fit.
@@ -2012,7 +2069,8 @@ void handleSerialFrame(char *line) {
     if (deserializeJson(doc, line + 11)) return;
     int id = doc["id"] | -1;
     uint32_t bytes = doc["bytes"] | 0;
-    uint32_t crc = doc["crc32"] | 0;
+    if (!doc["crc32"].is<uint32_t>()) { serialAck(id, false, "invalid pet checksum"); return; }
+    uint32_t crc = doc["crc32"].as<uint32_t>();
     if (bytes != CODEX_PET_DEVICE_BYTES) { serialAck(id, false, "invalid pet size"); return; }
     abortSerialPetUpload();
     LittleFS.remove(CODEX_PET_FILE);
@@ -2058,7 +2116,11 @@ void handleSerialFrame(char *line) {
     serialPetUploading = false;
     if (serialPetReceivedBytes != serialPetExpectedBytes ||
         (serialPetCRC ^ 0xFFFFFFFFUL) != serialPetExpectedCRC) {
-      abortSerialPetUpload(); serialAck(id, false, "pet checksum failed"); return;
+      uint32_t actualCRC = serialPetCRC ^ 0xFFFFFFFFUL;
+      char detail[96];
+      snprintf(detail, sizeof(detail), "pet checksum failed (expected %08lx, got %08lx)",
+               (unsigned long)serialPetExpectedCRC, (unsigned long)actualCRC);
+      abortSerialPetUpload(); serialAck(id, false, detail); return;
     }
     String error;
     bool ok = installCodexPetTemp(error);
@@ -2265,8 +2327,8 @@ void handleApiInfo() {
   x["status"] = codexStatus.status;
   x["custom_sprite"] = codexCustom || codexPetCustom;
   x["custom_pet"] = codexPetCustom;
-  x["w"] = CODEX_SPRITE_W;
-  x["h"] = CODEX_SPRITE_H;
+  x["w"] = codexPetCustom ? CODEX_PET_W : CODEX_SPRITE_W;
+  x["h"] = codexPetCustom ? CODEX_PET_H : CODEX_SPRITE_H;
   String out;
   serializeJson(doc, out);
   webServer.send(200, "application/json", out);
@@ -2344,6 +2406,8 @@ void handleSpriteRaw(ActiveApp slot) {
   if (slot == APP_CODEX && codexPetCustom) {
     const PetStateMeta &meta = codexPetStates[codexPetState];
     frames = meta.frames;
+    w = CODEX_PET_W;
+    h = CODEX_PET_H;
     rgb332Offset = meta.offset;
     rgb332 = LittleFS.open(CODEX_PET_FILE, "r");
   } else if (custom) {
@@ -2617,7 +2681,7 @@ void handleCodexGifUploadChunk() {
 
 void handleCodexPetUploadChunk() {
   if (webServer.upload().status == UPLOAD_FILE_START) {
-    // A 1MB LittleFS cannot hold two 821KB pets at once. Replacement is
+    // A 2MB LittleFS cannot hold two 1.18MB pets at once. Replacement is
     // intentionally fail-safe to the built-in pet rather than atomic.
     LittleFS.remove(CODEX_PET_FILE);
     LittleFS.remove(CODEX_SPRITE_FILE);
@@ -2708,7 +2772,10 @@ void setupWebServer() {
 void setup() {
   Serial.setRxBufferSize(2048); // a serial #STATUS frame (~600B) must survive a slow draw
   Serial.begin(115200);
-  LittleFS.begin();
+  if (!LittleFS.begin()) {
+    LittleFS.format(); // migrate the previous 1MB LittleFS partition to 2MB
+    LittleFS.begin();
+  }
   loadBridgeHost();
   loadBrightness();
   loadDisplayMode();
@@ -2852,14 +2919,12 @@ void loop() {
     if (nowMs - lastFlashMs >= FLASH_INTERVAL_MS) {
       lastFlashMs = nowMs;
       flashOn = !flashOn;
-      if (bridgeStale()) {
-        redrawRingOnly();
-      } else if (currentAppNeedsInput()) {
+      if (currentAppNeedsInput()) {
         // approval needed: blink the whole border red, restore the quota ring
-        // on the off-phase so it doesn't erase the normal chrome permanently
-        if (flashOn) drawFullBorder(agentEventActive() && agentEvent == EVENT_ATTENTION ? TFT_YELLOW : TFT_RED);
+        // on the off-phase so it doesn't erase the normal chrome permanently.
+        if (flashOn) drawFullBorder(TFT_RED);
         else redrawRingOnly();
-      } else if (agentEventActive() && agentEvent == EVENT_FAILURE) {
+      } else if (currentStatusFlashes()) {
         redrawRingOnly();
       }
     }
