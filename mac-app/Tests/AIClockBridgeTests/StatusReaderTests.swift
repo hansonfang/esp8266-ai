@@ -41,6 +41,11 @@ final class StatusReaderTests: XCTestCase {
         return ["timestamp": iso(offset), "type": "event_msg", "payload": payload]
     }
 
+    private func setMtime(id: String, at offset: TimeInterval) throws {
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(offset)],
+            ofItemAtPath: root.appendingPathComponent("rollout-\(id).jsonl").path)
+    }
+
     private func snapshot() -> CodexStatus {
         StatusService(claudeDir: root.appendingPathComponent("claude").path,
                       codexDir: root.path).snapshot().codex
@@ -88,17 +93,32 @@ final class StatusReaderTests: XCTestCase {
         XCTAssertFalse(status.needsInput)
     }
 
-    func testGenuineQuestionRemainsActionableWhileAnotherExecutionRuns() throws {
+    func testUnansweredInputCallWaits() throws {
+        let call: [String: Any] = [
+            "timestamp": iso(-5), "type": "response_item",
+            "payload": ["type": "function_call", "name": "request_user_input",
+                        "call_id": "question-1"],
+        ]
+        try writeRollout(id: "main", sessionID: "main", events: [call])
+
+        let status = snapshot()
+        XCTAssertEqual(status.status, "waiting")
+        XCTAssertTrue(status.needsInput)
+    }
+
+    func testNewerRunningExecutionOverridesOlderQuestion() throws {
         try writeRollout(id: "waiting", sessionID: "waiting",
                          events: [lifecycle("task_complete", at: -15,
                                             message: "请选择下一步？")])
         try writeRollout(id: "running", sessionID: "running",
                          events: [lifecycle("task_started", at: -5)])
+        try setMtime(id: "waiting", at: -15)
+        try setMtime(id: "running", at: -5)
 
         let status = snapshot()
-        XCTAssertEqual(status.status, "waiting")
+        XCTAssertEqual(status.status, "working")
         XCTAssertEqual(status.activeTasks, 1)
-        XCTAssertTrue(status.needsInput)
+        XCTAssertFalse(status.needsInput)
     }
 
     func testQuestionWithoutRunnableWorkWaits() throws {
@@ -109,6 +129,21 @@ final class StatusReaderTests: XCTestCase {
         let status = snapshot()
         XCTAssertEqual(status.status, "waiting")
         XCTAssertEqual(status.activeTasks, 0)
+        XCTAssertTrue(status.needsInput)
+    }
+
+    func testNewerQuestionOverridesOlderRunningExecution() throws {
+        try writeRollout(id: "running", sessionID: "running",
+                         events: [lifecycle("task_started", at: -15)])
+        try writeRollout(id: "waiting", sessionID: "waiting",
+                         events: [lifecycle("task_complete", at: -5,
+                                            message: "请确认是否继续？")])
+        try setMtime(id: "running", at: -15)
+        try setMtime(id: "waiting", at: -5)
+
+        let status = snapshot()
+        XCTAssertEqual(status.status, "waiting")
+        XCTAssertEqual(status.activeTasks, 1)
         XCTAssertTrue(status.needsInput)
     }
 
@@ -128,8 +163,10 @@ final class StatusReaderTests: XCTestCase {
     }
 
     func testKnownHookSessionCanStartNextTurnBeforeLogRefresh() throws {
-        try writeRollout(id: "visible", sessionID: "visible",
-                         events: [lifecycle("task_complete", at: -5)])
+        try writeRollout(id: "visible", sessionID: "visible", events: [])
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-60)],
+            ofItemAtPath: root.appendingPathComponent("rollout-visible.jsonl").path)
         let service = StatusService(claudeDir: root.appendingPathComponent("claude").path,
                                     codexDir: root.path)
 
@@ -139,5 +176,21 @@ final class StatusReaderTests: XCTestCase {
         XCTAssertEqual(status.status, "working")
         XCTAssertEqual(status.activeTasks, 1)
         XCTAssertEqual(status.petState, "running")
+    }
+
+    func testLateKnownHookCannotResurrectCompletedSession() throws {
+        try writeRollout(id: "visible", sessionID: "visible",
+                         events: [lifecycle("task_complete", at: -5)])
+        let service = StatusService(claudeDir: root.appendingPathComponent("claude").path,
+                                    codexDir: root.path)
+
+        // The hook arrives after task_complete in wall-clock order, as can
+        // happen when desktop drains PostToolUse after persisting the result.
+        service.recordEvent(agent: "codex", event: "PostToolUse", sessionID: "visible")
+        let status = service.snapshot().codex
+
+        XCTAssertEqual(status.status, "idle")
+        XCTAssertEqual(status.activeTasks, 0)
+        XCTAssertEqual(status.petState, "idle")
     }
 }

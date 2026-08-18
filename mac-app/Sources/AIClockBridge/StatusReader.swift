@@ -34,6 +34,7 @@ struct CodexStatus {
     // executions (parent + subagents), so execution ids — not the shared task
     // session id — are the unit counted by activeTasks.
     var activeExecutionIDs: Set<String> = []
+    var activeExecutionAt: [String: TimeInterval] = [:]
     var executionSessionIDs: [String: String] = [:]
     // Latest authoritative task_complete per session, used to suppress a
     // stale working hook when a desktop turn has already finished.
@@ -218,6 +219,7 @@ final class StatusService {
     private func mergeCodexEvents(into status: inout CodexStatus, now: TimeInterval) {
         codexEvents = codexEvents.filter { now - $0.value.at < workingEventTTL }
         codexPetEvents = codexPetEvents.filter { now - $0.value.at < $0.value.ttl }
+        codexNeedsInputAt = codexNeedsInputAt.filter { now - $0.value < needsInputTTL }
         let knownSessions = Set(status.executionSessionIDs.values)
         for (session, resolvedAt) in status.inputResolvedSessionAt {
             if let requestedAt = codexNeedsInputAt[session], resolvedAt >= requestedAt {
@@ -226,16 +228,18 @@ final class StatusService {
         }
 
         var active = status.activeExecutionIDs
+        var latestWorkingAt = active.compactMap { status.activeExecutionAt[$0] }.max() ?? 0
         var legacyWorking = false
         var hasFreshIdle = false
         for (session, event) in codexEvents {
             let ttl = event.state == "working" ? workingEventTTL : idleEventTTL
             guard now - event.at < ttl else { continue }
             if event.state == "working" {
-                // task_complete is written after the last tool hook. When it
-                // is newer, the JSONL lifecycle is the authoritative idle
-                // signal even if desktop Stop was delayed or omitted.
-                if let completedAt = status.completedSessionAt[session], completedAt >= event.at {
+                // A completed session must not be resurrected by a delayed
+                // PostToolUse/SubagentStop hook. A real next turn writes a
+                // new task_started almost immediately; the lifecycle scan
+                // then removes this completion marker and becomes active.
+                if status.completedSessionAt[session] != nil {
                     continue
                 }
                 if session == "__legacy__", knownSessions.isEmpty { legacyWorking = true }
@@ -245,6 +249,7 @@ final class StatusService {
                     active.insert(hookExecution)
                     status.executionSessionIDs[hookExecution] = session
                 }
+                latestWorkingAt = max(latestWorkingAt, event.at)
             } else {
                 hasFreshIdle = true
                 if session != "__legacy__" {
@@ -262,7 +267,9 @@ final class StatusService {
 
         status.activeExecutionIDs = active
         status.activeTasks = active.count + (legacyWorking ? 1 : 0)
-        let hasWaiting = !codexNeedsInputAt.isEmpty || !status.waitingExecutionAt.isEmpty
+        let latestWaitingAt = max(codexNeedsInputAt.values.max() ?? 0,
+                                  status.waitingExecutionAt.values.max() ?? 0)
+        let hasWaiting = latestWaitingAt > latestWorkingAt
         if status.activeTasks > 0 {
             status.status = "working"
         } else if hasFreshIdle, status.status == "working" {
@@ -303,7 +310,7 @@ final class StatusService {
 
     private let workingThreshold: TimeInterval = 20        // log touched within this -> "working"
     private let idleThreshold: TimeInterval = 30 * 60      // within this -> "idle", else "offline"
-    private let cacheTTL: TimeInterval = 5
+    private let cacheTTL: TimeInterval = 1
 
     private let lock = NSLock()
     private var cached: Snapshot?
@@ -527,6 +534,7 @@ final class StatusService {
         var latestRateLimits: [String: Any]? = nil
         var latestRateLimitsTs: Double = 0
         var activeExecutions: Set<String> = []
+        var activeExecutionAt: [String: TimeInterval] = [:]
         var executionSessionIDs: [String: String] = [:]
         var completedSessionAt: [String: TimeInterval] = [:]
         var waitingExecutionAt: [String: TimeInterval] = [:]
@@ -591,6 +599,7 @@ final class StatusService {
             }
             if !fileSawLifecycle, now - fileMtime < workingThreshold {
                 legacyActiveExecutions.insert(executionID)
+                activeExecutionAt[executionID] = fileMtime
             }
         }
         var sessionsWithRunnableWork: Set<String> = []
@@ -605,6 +614,7 @@ final class StatusService {
             } else if lifecycle.active,
                now - lifecycle.at < workingEventTTL || now - lifecycle.mtime < 2 * 60 {
                 activeExecutions.insert(executionID)
+                activeExecutionAt[executionID] = max(lifecycle.at, lifecycle.mtime)
                 sessionsWithRunnableWork.insert(lifecycle.sessionID)
             } else if !lifecycle.active {
                 completedSessionAt[lifecycle.sessionID] = max(
@@ -647,6 +657,7 @@ final class StatusService {
         var s = CodexStatus()
         s.tokensToday = tokensToday
         s.activeExecutionIDs = activeExecutions
+        s.activeExecutionAt = activeExecutionAt
         s.executionSessionIDs = executionSessionIDs
         s.completedSessionAt = completedSessionAt
         s.waitingExecutionAt = waitingExecutionAt

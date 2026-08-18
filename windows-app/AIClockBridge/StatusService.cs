@@ -36,6 +36,7 @@ class CodexStatus
     public string PetState = "idle";
     public int ActiveTasks;
     internal HashSet<string> ActiveExecutionIds = new();
+    internal Dictionary<string, double> ActiveExecutionAt = new();
     internal Dictionary<string, string> ExecutionSessionIds = new();
     internal Dictionary<string, double> CompletedSessionAt = new();
     internal Dictionary<string, double> WaitingExecutionAt = new();
@@ -45,6 +46,7 @@ class CodexStatus
     {
         var clone = (CodexStatus)this.MemberwiseCloneOf();
         clone.ActiveExecutionIds = new(ActiveExecutionIds);
+        clone.ActiveExecutionAt = new(ActiveExecutionAt);
         clone.ExecutionSessionIds = new(ExecutionSessionIds);
         clone.CompletedSessionAt = new(CompletedSessionAt);
         clone.WaitingExecutionAt = new(WaitingExecutionAt);
@@ -256,12 +258,16 @@ sealed class StatusService
         foreach (var key in _codexEvents.Where(x => now - x.Value.At >= WorkingEventTTL)
                      .Select(x => x.Key).ToArray())
             _codexEvents.Remove(key);
+        foreach (var key in _codexNeedsInputAt.Where(x => now - x.Value >= NeedsInputTTL)
+                     .Select(x => x.Key).ToArray())
+            _codexNeedsInputAt.Remove(key);
         foreach (var (session, resolvedAt) in status.InputResolvedSessionAt)
             if (_codexNeedsInputAt.TryGetValue(session, out var requestedAt) && resolvedAt >= requestedAt)
                 _codexNeedsInputAt.Remove(session);
 
         var knownSessions = status.ExecutionSessionIds.Values.ToHashSet();
         var active = new HashSet<string>(status.ActiveExecutionIds);
+        var latestWorkingAt = active.Select(id => status.ActiveExecutionAt.GetValueOrDefault(id)).DefaultIfEmpty().Max();
         var legacyWorking = false;
         var hasFreshIdle = false;
         foreach (var (session, ev) in _codexEvents)
@@ -270,8 +276,10 @@ sealed class StatusService
             if (now - ev.At >= ttl) continue;
             if (ev.State == "working")
             {
-                if (status.CompletedSessionAt.TryGetValue(session, out var completedAt)
-                    && completedAt >= ev.At) continue;
+                // Never let a delayed tool/subagent hook resurrect a session
+                // whose latest rollout lifecycle is already complete. A real
+                // next turn clears the marker through its task_started event.
+                if (status.CompletedSessionAt.ContainsKey(session)) continue;
                 if (session == "__legacy__" && knownSessions.Count == 0) legacyWorking = true;
                 else if (knownSessions.Contains(session)
                          && !active.Any(id => status.ExecutionSessionIds.GetValueOrDefault(id) == session))
@@ -280,6 +288,7 @@ sealed class StatusService
                     active.Add(id);
                     status.ExecutionSessionIds[id] = session;
                 }
+                latestWorkingAt = Math.Max(latestWorkingAt, ev.At);
             }
             else
             {
@@ -292,7 +301,9 @@ sealed class StatusService
 
         status.ActiveExecutionIds = active;
         status.ActiveTasks = active.Count + (legacyWorking ? 1 : 0);
-        var hasWaiting = _codexNeedsInputAt.Count > 0 || status.WaitingExecutionAt.Count > 0;
+        var latestWaitingAt = Math.Max(_codexNeedsInputAt.Values.DefaultIfEmpty().Max(),
+                                       status.WaitingExecutionAt.Values.DefaultIfEmpty().Max());
+        var hasWaiting = latestWaitingAt > latestWorkingAt;
         if (status.ActiveTasks > 0) status.Status = "working";
         else if (hasFreshIdle && status.Status == "working") status.Status = "idle";
         status.NeedsInput = hasWaiting;
@@ -306,7 +317,7 @@ sealed class StatusService
 
     const double WorkingThreshold = 20;        // log touched within this -> "working"
     const double IdleThreshold = 30 * 60;      // within this -> "idle", else "offline"
-    const double CacheTTL = 5;
+    const double CacheTTL = 1;
 
     readonly object _lock = new();
     StatusSnapshot _cached;
@@ -582,6 +593,7 @@ sealed class StatusService
         }
 
         var activeExecutions = new HashSet<string>();
+        var activeExecutionAt = new Dictionary<string, double>();
         var executionSessionIds = new Dictionary<string, string>();
         var completedSessionAt = new Dictionary<string, double>();
         var waitingExecutionAt = new Dictionary<string, double>();
@@ -654,7 +666,10 @@ sealed class StatusService
                 }
             }
             if (!fileSawLifecycle && now - fileMtime < WorkingThreshold)
+            {
                 legacyActiveExecutions.Add(executionId);
+                activeExecutionAt[executionId] = fileMtime;
+            }
         }
 
         var sessionsWithRunnableWork = new HashSet<string>();
@@ -669,6 +684,7 @@ sealed class StatusService
                      && (now - lifecycle.At < WorkingEventTTL || now - lifecycle.Mtime < 2 * 60))
             {
                 activeExecutions.Add(executionId);
+                activeExecutionAt[executionId] = Math.Max(lifecycle.At, lifecycle.Mtime);
                 sessionsWithRunnableWork.Add(lifecycle.SessionId);
             }
             else if (!lifecycle.Active)
@@ -737,6 +753,7 @@ sealed class StatusService
         {
             TokensToday = tokensToday,
             ActiveExecutionIds = activeExecutions,
+            ActiveExecutionAt = activeExecutionAt,
             ExecutionSessionIds = executionSessionIds,
             CompletedSessionAt = completedSessionAt,
             WaitingExecutionAt = waitingExecutionAt,
