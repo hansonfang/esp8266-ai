@@ -37,13 +37,18 @@ else
   bridge_stopped=0
 fi
 
-for _ in {1..30}; do
+last_status=""
+for _ in {1..120}; do
   if status_json="$(curl -sS http://127.0.0.1:8765/api/status 2>/dev/null)"; then
-    echo "$status_json"
-    exit 0
+    last_status="$status_json"
+    if [[ "$status_json" == *'"connected":true'* && "$status_json" == *'"custom_pet":true'* ]]; then
+      echo "$status_json"
+      exit 0
+    fi
   fi
   sleep 0.25
 done
 
-echo "Pet installed, but the USB control page did not return after 7.5 seconds." >&2
+if [[ -n "$last_status" ]]; then echo "Last bridge status: $last_status" >&2; fi
+echo "Pet installed, but the bridge did not confirm a connected custom pet within 30 seconds." >&2
 exit 1

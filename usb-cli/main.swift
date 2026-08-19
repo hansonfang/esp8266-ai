@@ -5,8 +5,92 @@ import CoreGraphics
 
 private let defaultPort: UInt16 = 8765
 
+/// The USB-only importer writes the 144x144 AIPET1 format used by the
+/// enlarged ESP pet. Keep the desktop app's 120x120 encoder unchanged.
+private enum HighResPetPackageBuilder {
+    static let targetWidth = 144
+    static let targetHeight = 144
+
+    static func buildDeviceFile(from package: CodexPetPackage) throws -> Data {
+        let entrySize = 12
+        let headerSize = 20 + CodexPetPackageService.states.count * entrySize
+        var payload = Data(capacity: CodexPetPackageService.states.reduce(0) { $0 + $1.frames } * targetWidth * targetHeight)
+        var entries: [(frames: Int, delay: Int, offset: Int, length: Int)] = []
+
+        for (row, state) in CodexPetPackageService.states.enumerated() {
+            let offset = headerSize + payload.count
+            for column in 0..<state.frames {
+                guard let frame = renderFrame(sheet: package.spritesheet, row: row, column: column) else {
+                    throw NSError(domain: "aiclock-usb", code: 1,
+                                  userInfo: [NSLocalizedDescriptionKey: "无法转换 \(state.id) 第 \(column + 1) 帧"])
+                }
+                payload.append(frame)
+            }
+            entries.append((state.frames, max(50, state.durationMs / state.frames),
+                            offset, state.frames * targetWidth * targetHeight))
+        }
+
+        var out = Data("AIPET1".utf8)
+        appendLE(UInt16(targetWidth), to: &out)
+        appendLE(UInt16(targetHeight), to: &out)
+        out.append(UInt8(CodexPetPackageService.states.count))
+        out.append(0)
+        appendLE(UInt32(headerSize + payload.count), to: &out)
+        appendLE(CodexPetPackageService.crc32(payload), to: &out)
+        for entry in entries {
+            out.append(UInt8(entry.frames))
+            out.append(0)
+            appendLE(UInt16(entry.delay), to: &out)
+            appendLE(UInt32(entry.offset), to: &out)
+            appendLE(UInt32(entry.length), to: &out)
+        }
+        out.append(payload)
+        return out
+    }
+
+    private static func renderFrame(sheet: CGImage, row: Int, column: Int) -> Data? {
+        let cropRect = CGRect(x: column * CodexPetPackageService.cellWidth,
+                              y: row * CodexPetPackageService.cellHeight,
+                              width: CodexPetPackageService.cellWidth,
+                              height: CodexPetPackageService.cellHeight)
+        guard let crop = sheet.cropping(to: cropRect) else { return nil }
+        let bytesPerRow = targetWidth * 4
+        var rgba = [UInt8](repeating: 0, count: bytesPerRow * targetHeight)
+        guard let ctx = CGContext(data: &rgba, width: targetWidth, height: targetHeight,
+                                  bitsPerComponent: 8, bytesPerRow: bytesPerRow,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.setFillColor(CGColor.black)
+        ctx.fill(CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
+        let scale = min(CGFloat(targetWidth) / CGFloat(CodexPetPackageService.cellWidth),
+                        CGFloat(targetHeight) / CGFloat(CodexPetPackageService.cellHeight))
+        let w = CGFloat(CodexPetPackageService.cellWidth) * scale
+        let h = CGFloat(CodexPetPackageService.cellHeight) * scale
+        ctx.interpolationQuality = .none
+        ctx.draw(crop, in: CGRect(x: (CGFloat(targetWidth) - w) / 2,
+                                  y: (CGFloat(targetHeight) - h) / 2, width: w, height: h))
+
+        var rgb332 = Data(count: targetWidth * targetHeight)
+        rgb332.withUnsafeMutableBytes { raw in
+            let dst = raw.bindMemory(to: UInt8.self)
+            for i in 0..<(targetWidth * targetHeight) {
+                let r = rgba[i * 4]
+                let g = rgba[i * 4 + 1]
+                let b = rgba[i * 4 + 2]
+                dst[i] = (r & 0xE0) | ((g & 0xE0) >> 3) | (b >> 6)
+            }
+        }
+        return rgb332
+    }
+
+    private static func appendLE<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
+        var little = value.littleEndian
+        withUnsafeBytes(of: &little) { data.append(contentsOf: $0) }
+    }
+}
+
 final class USBClock {
-    private static let codexPetBytes = 820_928
+    private static let codexPetBytes = 1_182_080
     private static let petChunkBytes = 768
     private let service: StatusService
     private let lock = NSLock()
@@ -130,9 +214,12 @@ final class USBClock {
             sequence += 1
             lock.lock(); petUploadSent = offset; lock.unlock()
         }
-        guard let end = request(prefix: "#PET_END ", body: [:], timeout: 30),
-              end["ok"] as? Bool == true else {
+        guard let end = request(prefix: "#PET_END ", body: [:], timeout: 30) else {
             return finishPetUpload(error: "设备校验或安装失败")
+        }
+        guard end["ok"] as? Bool == true else {
+            let detail = end["error"] as? String ?? "未知错误"
+            return finishPetUpload(error: "设备校验或安装失败：\(detail)")
         }
         lock.lock(); customPet = true; lock.unlock()
         finishPetUpload(error: nil)
@@ -485,7 +572,7 @@ final class LocalServer {
     </main>
     <script>
     const $=id=>document.getElementById(id), fmt=n=>n==null?'—':n+'%', fmtMin=n=>n==null?'—':n<60?n+' 分钟':Math.floor(n/60)+' 小时';
-    const states=[[6,1100],[8,1060],[8,1060],[4,700],[5,840],[8,1220],[6,1010],[6,820],[6,1030]], frameW=192,frameH=208,target=120,headerBytes=128,totalBytes=820928;
+    const states=[[6,1100],[8,1060],[8,1060],[4,700],[5,840],[8,1220],[6,1010],[6,820],[6,1030]], frameW=192,frameH=208,target=144,headerBytes=128,totalBytes=1182080;
     let lastUploadActive=false;
     async function load(){try{let x=await fetch('/api/status').then(r=>r.json()),c=x.codex,u=x.usb,p=u.pet_upload;$('usb').textContent=u.connected?'已连接 '+u.port:'未连接';$('fw').textContent=u.fw?(u.fw+' · 协议 '+u.protocol):'—';$('petKind').textContent=u.custom_pet?'自定义九状态':'默认';$('status').textContent=c.status+' · '+c.pet_state+' · '+c.active_tasks+' agent';$('deviceState').textContent=u.device_pet_state||'—';$('weekly').textContent=fmt(c.weekly_pct);$('reset').textContent=fmtMin(c.weekly_reset_min);if(u.brightness!=null){$('brightness').value=u.brightness;$('level').textContent=u.brightness+'%'}if(u.display)$('mode').value=u.display;if(p){let pct=p.total?Math.round(p.sent*100/p.total):0;$('petProgress').value=pct;$('petReset').disabled=p.active;if(p.active){$('petUpload').disabled=true;$('petNotice').textContent='USB 上传中 '+pct+'%（'+p.sent+' / '+p.total+' 字节）'}else if(lastUploadActive){$('petUpload').disabled=false;$('petNotice').textContent=p.error?'上传失败：'+p.error:'✅ 九状态宠物已安装';}lastUploadActive=p.active}}catch{$('usb').textContent='服务不可用'}}
     async function call(path,body){let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}),x=await r.json();$('notice').textContent=r.ok?'设备已确认':x.error;return r.ok}
@@ -505,7 +592,7 @@ final class LocalServer {
 }
 
 private func printUsage() {
-    print("Usage: aiclock-usb <serve|status|brightness|pet-install|doctor|open|install|uninstall>")
+    print("Usage: aiclock-usb <serve|status|brightness|pet-preflight|pet-install|doctor|open|install|uninstall>")
 }
 
 private func installLaunchAgent() throws {
@@ -557,11 +644,36 @@ case "brightness":
     RunLoop.current.run(until: Date().addingTimeInterval(0.6))
     guard let ack = clock.setBrightness(level), (ack["ok"] as? Bool) == true else { fputs("Clock did not confirm the brightness command.\n", stderr); exit(1) }
     print("Brightness confirmed: \(ack["brightness"] ?? level)%")
+case "pet-preflight":
+    guard let raw = CommandLine.arguments.dropFirst(2).first else { printUsage(); exit(2) }
+    do {
+        let source = URL(fileURLWithPath: (raw as NSString).expandingTildeInPath)
+        let package = try CodexPetPackageService.load(from: source)
+        let pet = try HighResPetPackageBuilder.buildDeviceFile(from: package)
+        let payloadCRC = UInt32(pet[16]) | (UInt32(pet[17]) << 8) |
+                         (UInt32(pet[18]) << 16) | (UInt32(pet[19]) << 24)
+        let report: [String: Any] = [
+            "ok": true,
+            "id": package.id,
+            "display_name": package.displayName,
+            "source": source.standardizedFileURL.path,
+            "sprite_version": package.spritesheet.height == 2288 ? 2 : 1,
+            "spritesheet": ["width": package.spritesheet.width, "height": package.spritesheet.height],
+            "frames": CodexPetPackageService.states.reduce(0) { $0 + $1.frames },
+            "device_bytes": pet.count,
+            "payload_crc32": String(format: "%08x", payloadCRC),
+        ]
+        let json = try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
+        print(String(decoding: json, as: UTF8.self))
+    } catch {
+        fputs("Pet preflight failed: \(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
 case "pet-install":
     guard let raw = CommandLine.arguments.dropFirst(2).first else { printUsage(); exit(2) }
     do {
         let package = try CodexPetPackageService.load(from: URL(fileURLWithPath: (raw as NSString).expandingTildeInPath))
-        let pet = try CodexPetPackageService.buildDeviceFile(from: package)
+        let pet = try HighResPetPackageBuilder.buildDeviceFile(from: package)
         let clock = USBClock(service: service); clock.start()
         let connectDeadline = Date().addingTimeInterval(10)
         while Date() < connectDeadline, (clock.state["connected"] as? Bool) != true {

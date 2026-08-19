@@ -743,7 +743,7 @@ String pctText(float pct) {
 // Quota readout in the left sidebar. Values repaint only when their text
 // changes (force = after a full-screen clear), so the 5s poll never flashes.
 const int QUOTA_5H_LABEL_Y = 66, QUOTA_5H_VALUE_Y = 78;
-const int QUOTA_WK_LABEL_Y = 174, QUOTA_WK_VALUE_Y = 188;
+const int QUOTA_WK_LABEL_Y = 174, QUOTA_WK_VALUE_Y = 200;
 String lastQuota5h, lastQuotaWk;
 
 // pushImage() colors must be pre-byte-swapped (this firmware never enables
@@ -949,7 +949,7 @@ void drawQuotaText(float hourPct, float weekPct, bool force) {
       lastQuotaWk = v;
       lastQuota5h = "";
       tft.fillRect(15, QUOTA_WK_VALUE_Y, 58, 22, TFT_BLACK);
-      drawDotTextC(v, SIDEBAR_CX, QUOTA_WK_VALUE_Y, 3, 0, TFT_WHITE);
+      drawSqTextC(v, SIDEBAR_CX, QUOTA_WK_VALUE_Y, 3, 2, TFT_WHITE);
     }
     return;
   }
@@ -966,7 +966,7 @@ void drawQuotaText(float hourPct, float weekPct, bool force) {
   if (force || v2 != lastQuotaWk) {
     lastQuotaWk = v2;
     tft.fillRect(15, QUOTA_WK_VALUE_Y, 58, 22, TFT_BLACK);
-    drawDotTextC(v2, SIDEBAR_CX, QUOTA_WK_VALUE_Y, 3, 0, TFT_WHITE);
+    drawSqTextC(v2, SIDEBAR_CX, QUOTA_WK_VALUE_Y, 3, 2, TFT_WHITE);
   }
 }
 
@@ -1091,7 +1091,7 @@ void drawAgentEventLabel() {
 // Days until the weekly window resets in the left sidebar. Weekly only - the
 // 5h window is too short for a day count to say anything. Under a day it
 // degrades to hours.
-const int RESET_CX = SIDEBAR_CX, RESET_LABEL_Y = 120, RESET_VALUE_Y = 135;
+const int RESET_CX = SIDEBAR_CX, RESET_LABEL_Y = 105, RESET_VALUE_Y = 120;
 String lastResetDays;
 
 String resetDaysText(int min) {

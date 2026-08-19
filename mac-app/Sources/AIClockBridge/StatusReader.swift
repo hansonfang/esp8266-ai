@@ -284,17 +284,14 @@ final class StatusService {
             status.status = "waiting"
             status.petState = "waiting"
         } else if status.status == "working" {
-            // Ignore a completed session's success animation while another
-            // session is still running. Prefer actionable active visuals.
-            let activeVisuals = codexPetEvents.compactMap { session, event -> PetVisualEvent? in
-                guard session == "__legacy__"
-                    || active.contains(where: { status.executionSessionIDs[$0] == session }) else { return nil }
+            // The freshest known task event owns the shared pet. This lets a
+            // completed task show its short success animation even while a
+            // sibling task remains active; the sibling's next event wins back.
+            let visibleVisuals = codexPetEvents.compactMap { session, event -> PetVisualEvent? in
+                guard session == "__legacy__" || knownSessions.contains(session) else { return nil }
                 return event
             }
-            let priority = ["waiting": 4, "failed": 3, "review": 2, "running": 1]
-            status.petState = activeVisuals.max {
-                (priority[$0.state] ?? 0, $0.at) < (priority[$1.state] ?? 0, $1.at)
-            }?.state ?? "running"
+            status.petState = visibleVisuals.max { $0.at < $1.at }?.state ?? "running"
         } else {
             // Hooks from hidden approval/review sessions can reach the global
             // hook config without ever producing a user-visible rollout.

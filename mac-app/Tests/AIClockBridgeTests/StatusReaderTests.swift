@@ -193,4 +193,21 @@ final class StatusReaderTests: XCTestCase {
         XCTAssertEqual(status.activeTasks, 0)
         XCTAssertEqual(status.petState, "idle")
     }
+
+    func testLatestCompletedSessionVisualOverridesOlderRunningVisual() throws {
+        try writeRollout(id: "finishing", sessionID: "finishing",
+                         events: [lifecycle("task_started", at: -10)])
+        try writeRollout(id: "sibling", sessionID: "sibling",
+                         events: [lifecycle("task_started", at: -10)])
+        let service = StatusService(claudeDir: root.appendingPathComponent("claude").path,
+                                    codexDir: root.path)
+
+        service.recordEvent(agent: "codex", event: "PreToolUse", sessionID: "sibling")
+        service.recordEvent(agent: "codex", event: "Stop", sessionID: "finishing")
+        let status = service.snapshot().codex
+
+        XCTAssertEqual(status.status, "working")
+        XCTAssertEqual(status.activeTasks, 1)
+        XCTAssertEqual(status.petState, "jumping")
+    }
 }

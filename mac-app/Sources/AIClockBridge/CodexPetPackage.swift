@@ -13,6 +13,7 @@ enum CodexPetPackageService {
     static let cellHeight = 208
     static let sheetWidth = 1536
     static let sheetHeight = 1872
+    static let extendedSheetHeight = 2288
     static let targetWidth = 120
     static let targetHeight = 120
 
@@ -50,8 +51,12 @@ enum CodexPetPackageService {
               let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
             throw error("无法读取 spritesheet（需要 PNG 或 WebP）")
         }
-        guard image.width == sheetWidth, image.height == sheetHeight else {
-            throw error("仅支持 1536×1872 的 Codex 8×9 spritesheet")
+        let isV2 = (manifest["spriteVersionNumber"] as? NSNumber)?.intValue == 2
+        let expectedHeight = isV2 ? extendedSheetHeight : sheetHeight
+        guard image.width == sheetWidth, image.height == expectedHeight else {
+            throw error(isV2
+                        ? "v2 Codex spritesheet 必须是 1536×2288"
+                        : "仅支持 1536×1872 的 Codex 8×9 spritesheet")
         }
         return CodexPetPackage(id: id,
                                displayName: manifest["displayName"] as? String ?? id,
