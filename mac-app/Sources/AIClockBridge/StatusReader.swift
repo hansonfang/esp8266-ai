@@ -54,8 +54,7 @@ struct Snapshot {
     var musicPlaying: Bool = false
 }
 
-/// Reads the logs and derives status, with a small time cache so back-to-back
-/// HTTP polls and the menu-bar timer don't each re-scan the whole tree.
+/// Reads logs in the background so device /status requests stay fast.
 final class StatusService {
     private let claudeDir: String
     private let codexDir: String
@@ -307,11 +306,12 @@ final class StatusService {
 
     private let workingThreshold: TimeInterval = 20        // log touched within this -> "working"
     private let idleThreshold: TimeInterval = 30 * 60      // within this -> "idle", else "offline"
-    private let cacheTTL: TimeInterval = 1
 
     private let lock = NSLock()
+    private let refreshLock = NSLock()
+    private let refreshQueue = DispatchQueue(label: "aiclock.status.refresh")
+    private var refreshQueued = false
     private var cached: Snapshot?
-    private var cachedAt: TimeInterval = 0
     private var codexTailCache: [String: (mtime: TimeInterval, lines: [String])] = [:]
     private var codexRolloutInfoCache: [String: CodexRolloutInfo] = [:]
 
@@ -326,18 +326,31 @@ final class StatusService {
         return f
     }()
 
+    /// Queues one scan; timer ticks while it is running are intentionally skipped.
+    func refresh() {
+        refreshLock.lock()
+        guard !refreshQueued else { refreshLock.unlock(); return }
+        refreshQueued = true
+        refreshLock.unlock()
+
+        refreshQueue.async { [weak self] in
+            guard let self else { return }
+            let now = Date().timeIntervalSince1970
+            let fresh = Snapshot(claude: self.readClaude(), codex: self.readCodex(), ts: Int(now))
+            self.lock.lock()
+            self.cached = fresh
+            self.lock.unlock()
+            self.refreshLock.lock()
+            self.refreshQueued = false
+            self.refreshLock.unlock()
+        }
+    }
+
     func snapshot() -> Snapshot {
         lock.lock()
         defer { lock.unlock() }
         let now = Date().timeIntervalSince1970
-        var snap: Snapshot
-        if let c = cached, now - cachedAt < cacheTTL {
-            snap = c
-        } else {
-            snap = Snapshot(claude: readClaude(), codex: readCodex(), ts: Int(now))
-            cached = snap
-            cachedAt = now
-        }
+        var snap = cached ?? Snapshot(claude: ClaudeStatus(), codex: CodexStatus(), ts: Int(now))
         snap.ts = Int(now)
 
         // overlays are cheap and applied on every call, so hook events and

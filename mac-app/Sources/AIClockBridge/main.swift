@@ -35,6 +35,8 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--test-pet" {
 
 let port: UInt16 = 8765
 let service = StatusService()
+service.refresh()
+Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in service.refresh() }
 let usage = UsageFetcher()
 service.usage = usage
 let netMonitor = NetSpeedMonitor()

@@ -51,6 +51,28 @@ final class StatusReaderTests: XCTestCase {
                       codexDir: root.path).snapshot().codex
     }
 
+    func testSnapshotDoesNotSynchronouslyScanCodexLogs() throws {
+        try writeRollout(id: "main", sessionID: "main",
+                         events: [lifecycle("task_started", at: -1)])
+
+        XCTAssertEqual(snapshot().status, "offline")
+    }
+
+    func testRefreshPublishesCodexLogState() throws {
+        try writeRollout(id: "main", sessionID: "main",
+                         events: [lifecycle("task_started", at: -1)])
+        let service = StatusService(claudeDir: root.appendingPathComponent("claude").path,
+                                    codexDir: root.path)
+
+        service.refresh()
+        let deadline = Date().addingTimeInterval(1)
+        while Date() < deadline {
+            if service.snapshot().codex.status == "working" { return }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTFail("background refresh did not publish the log status")
+    }
+
     func testSubagentCompletionDoesNotStopParentOrSibling() throws {
         let session = "parent"
         try writeRollout(id: session, sessionID: session,
