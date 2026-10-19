@@ -47,15 +47,18 @@ final class StatusReaderTests: XCTestCase {
     }
 
     private func snapshot() -> CodexStatus {
-        StatusService(claudeDir: root.appendingPathComponent("claude").path,
-                      codexDir: root.path).snapshot().codex
+        let service = StatusService(claudeDir: root.appendingPathComponent("claude").path,
+                                    codexDir: root.path)
+        service.refreshNow()
+        return service.snapshot().codex
     }
 
     func testSnapshotDoesNotSynchronouslyScanCodexLogs() throws {
         try writeRollout(id: "main", sessionID: "main",
                          events: [lifecycle("task_started", at: -1)])
-
-        XCTAssertEqual(snapshot().status, "offline")
+        let service = StatusService(claudeDir: root.appendingPathComponent("claude").path,
+                                    codexDir: root.path)
+        XCTAssertEqual(service.snapshot().codex.status, "offline")
     }
 
     func testRefreshPublishesCodexLogState() throws {
@@ -174,6 +177,7 @@ final class StatusReaderTests: XCTestCase {
                          events: [lifecycle("task_complete", at: -5)])
         let service = StatusService(claudeDir: root.appendingPathComponent("claude").path,
                                     codexDir: root.path)
+        service.refreshNow()
 
         service.recordEvent(agent: "codex", event: "PreToolUse",
                             sessionID: "hidden-approval-reviewer")
@@ -191,6 +195,7 @@ final class StatusReaderTests: XCTestCase {
             ofItemAtPath: root.appendingPathComponent("rollout-visible.jsonl").path)
         let service = StatusService(claudeDir: root.appendingPathComponent("claude").path,
                                     codexDir: root.path)
+        service.refreshNow()
 
         service.recordEvent(agent: "codex", event: "PreToolUse", sessionID: "visible")
         let status = service.snapshot().codex
@@ -205,6 +210,7 @@ final class StatusReaderTests: XCTestCase {
                          events: [lifecycle("task_complete", at: -5)])
         let service = StatusService(claudeDir: root.appendingPathComponent("claude").path,
                                     codexDir: root.path)
+        service.refreshNow()
 
         // The hook arrives after task_complete in wall-clock order, as can
         // happen when desktop drains PostToolUse after persisting the result.
@@ -216,13 +222,14 @@ final class StatusReaderTests: XCTestCase {
         XCTAssertEqual(status.petState, "idle")
     }
 
-    func testLatestCompletedSessionVisualOverridesOlderRunningVisual() throws {
+    func testCompletedSiblingDoesNotInterruptRunningPet() throws {
         try writeRollout(id: "finishing", sessionID: "finishing",
                          events: [lifecycle("task_started", at: -10)])
         try writeRollout(id: "sibling", sessionID: "sibling",
                          events: [lifecycle("task_started", at: -10)])
         let service = StatusService(claudeDir: root.appendingPathComponent("claude").path,
                                     codexDir: root.path)
+        service.refreshNow()
 
         service.recordEvent(agent: "codex", event: "PreToolUse", sessionID: "sibling")
         service.recordEvent(agent: "codex", event: "Stop", sessionID: "finishing")
@@ -230,6 +237,6 @@ final class StatusReaderTests: XCTestCase {
 
         XCTAssertEqual(status.status, "working")
         XCTAssertEqual(status.activeTasks, 1)
-        XCTAssertEqual(status.petState, "jumping")
+        XCTAssertEqual(status.petState, "running")
     }
 }

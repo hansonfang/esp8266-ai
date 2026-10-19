@@ -283,11 +283,10 @@ final class StatusService {
             status.status = "waiting"
             status.petState = "waiting"
         } else if status.status == "working" {
-            // The freshest known task event owns the shared pet. This lets a
-            // completed task show its short success animation even while a
-            // sibling task remains active; the sibling's next event wins back.
+            // A completed task must not interrupt a sibling's running pet.
             let visibleVisuals = codexPetEvents.compactMap { session, event -> PetVisualEvent? in
-                guard session == "__legacy__" || knownSessions.contains(session) else { return nil }
+                guard event.state != "jumping",
+                      session == "__legacy__" || knownSessions.contains(session) else { return nil }
                 return event
             }
             status.petState = visibleVisuals.max { $0.at < $1.at }?.state ?? "running"
@@ -335,15 +334,22 @@ final class StatusService {
 
         refreshQueue.async { [weak self] in
             guard let self else { return }
-            let now = Date().timeIntervalSince1970
-            let fresh = Snapshot(claude: self.readClaude(), codex: self.readCodex(), ts: Int(now))
-            self.lock.lock()
-            self.cached = fresh
-            self.lock.unlock()
+            self.scan()
             self.refreshLock.lock()
             self.refreshQueued = false
             self.refreshLock.unlock()
         }
+    }
+
+    /// For one-shot CLI commands and tests; never called on a device request path.
+    func refreshNow() { refreshQueue.sync { scan() } }
+
+    private func scan() {
+        let now = Date().timeIntervalSince1970
+        let fresh = Snapshot(claude: readClaude(), codex: readCodex(), ts: Int(now))
+        lock.lock()
+        cached = fresh
+        lock.unlock()
     }
 
     func snapshot() -> Snapshot {

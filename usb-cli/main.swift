@@ -625,11 +625,14 @@ let usage = UsageFetcher(); service.usage = usage
 
 switch command {
 case "serve":
+    service.refresh()
+    Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in service.refresh() }
     usage.startAutoRefresh()
     let clock = USBClock(service: service); clock.start()
     do { let server = try LocalServer(port: defaultPort, service: service, clock: clock); server.start(); print("AI Clock USB is running at http://127.0.0.1:\(defaultPort)"); RunLoop.main.run() }
     catch { fputs("Could not start server: \(error.localizedDescription)\n", stderr); exit(1) }
 case "status":
+    service.refreshNow()
     let s = service.snapshot().codex
     let data = try! JSONSerialization.data(withJSONObject: [
         "status": s.status, "pet_state": s.petState, "needs_input": s.needsInput,
